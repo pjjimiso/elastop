@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -193,8 +194,10 @@ type GitHubRelease struct {
 }
 
 var (
-	latestVersion string
-	versionCache  time.Time
+	latestVersionMu   sync.RWMutex
+	latestVersion     string
+	latestVersionErr  error
+	latestVersionDone bool
 )
 
 var indexActivities = make(map[string]*IndexActivity)
@@ -229,11 +232,6 @@ type DataStream struct {
 var (
 	apiKey string
 )
-
-type CatNodesStats struct {
-	Load1m string `json:"load_1m"`
-	Name   string `json:"name"`
-}
 
 func bytesToHuman(bytes int64) string {
 	const unit = 1024
@@ -289,27 +287,52 @@ func getPercentageColor(percent float64) string {
 	}
 }
 
-func getLatestVersion() string {
-	// Only fetch every hour
-	if time.Since(versionCache) < time.Hour && latestVersion != "" {
-		return latestVersion
-	}
+func getLatestVersion() (version string, fetched bool, err error) {
+	latestVersionMu.RLock()
+	defer latestVersionMu.RUnlock()
+	return latestVersion, latestVersionDone, latestVersionErr
+}
 
+// Fetches and updates the package state
+func fetchLatestVersion() time.Duration {
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get("https://api.github.com/repos/elastic/elasticsearch/releases/latest")
+
+	latestVersionMu.Lock()
+	defer latestVersionMu.Unlock()
+	latestVersionDone = true
+
 	if err != nil {
-		return ""
+		latestVersionErr = err
+		return 30 * time.Second
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		latestVersionErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+		return 30 * time.Second
+	}
+
 	var release GitHubRelease
 	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		return ""
+		latestVersionErr = err
+		return 30 * time.Second
 	}
 
 	latestVersion = strings.TrimPrefix(release.TagName, "v")
-	versionCache = time.Now()
-	return latestVersion
+	latestVersionErr = nil
+	return time.Hour
+}
+
+// Run fetchLatestVersion in a loop in the background
+// so the UI never blocks on api.github.com
+func startVersionPoller() {
+	go func() {
+		for {
+			next := fetchLatestVersion()
+			time.Sleep(next)
+		}
+	}()
 }
 
 func compareVersions(current, latest string) bool {
@@ -317,11 +340,9 @@ func compareVersions(current, latest string) bool {
 		return true
 	}
 
-	// Clean up version strings
 	current = strings.TrimPrefix(current, "v")
 	latest = strings.TrimPrefix(latest, "v")
 
-	// Split versions into parts
 	currentParts := strings.Split(current, ".")
 	latestParts := strings.Split(latest, ".")
 
@@ -689,477 +710,493 @@ func main() {
 			return json.Unmarshal(body, target)
 		}
 
+		// Display an error on the given panel from the fetch goroutine.
+		// Must be called via QueueUpdateDraw so tview redraws.
+		showError := func(panel *tview.TextView, msg string) {
+			app.QueueUpdateDraw(func() {
+				panel.SetText(msg)
+			})
+		}
+
 		// Get cluster stats
 		var clusterStats ClusterStats
 		if err := makeRequest("/_cluster/stats", &clusterStats); err != nil {
-			header.SetText(fmt.Sprintf("[red]Error: %v", err))
+			showError(header, fmt.Sprintf("[red]Error: %v", err))
 			return
 		}
 
 		// Get nodes info
 		var nodesInfo NodesInfo
 		if err := makeRequest("/_nodes", &nodesInfo); err != nil {
-			nodesPanel.SetText(fmt.Sprintf("[red]Error: %v", err))
+			showError(nodesPanel, fmt.Sprintf("[red]Error: %v", err))
 			return
 		}
 
 		// Get indices stats
 		var indicesStats IndexStats
 		if err := makeRequest("/_cat/indices?format=json", &indicesStats); err != nil {
-			indicesPanel.SetText(fmt.Sprintf("[red]Error: %v", err))
+			showError(indicesPanel, fmt.Sprintf("[red]Error: %v", err))
 			return
 		}
 
 		// Get cluster health
 		var clusterHealth ClusterHealth
 		if err := makeRequest("/_cluster/health", &clusterHealth); err != nil {
-			indicesPanel.SetText(fmt.Sprintf("[red]Error: %v", err))
+			showError(indicesPanel, fmt.Sprintf("[red]Error: %v", err))
 			return
 		}
 
 		// Get nodes stats
 		var nodesStats NodesStats
 		if err := makeRequest("/_nodes/stats", &nodesStats); err != nil {
-			indicesPanel.SetText(fmt.Sprintf("[red]Error: %v", err))
+			showError(indicesPanel, fmt.Sprintf("[red]Error: %v", err))
 			return
 		}
 
 		// Get index write stats
 		var indexWriteStats IndexWriteStats
 		if err := makeRequest("/_stats", &indexWriteStats); err != nil {
-			indicesPanel.SetText(fmt.Sprintf("[red]Error getting write stats: %v", err))
+			showError(indicesPanel, fmt.Sprintf("[red]Error getting write stats: %v", err))
 			return
-		}
-
-		// Query and indexing metrics
-		var (
-			totalQueries   int64
-			totalQueryTime int64
-			totalIndexing  int64
-			totalIndexTime int64
-			totalSegments  int64
-		)
-
-		for _, node := range nodesStats.Nodes {
-			totalQueries += node.Indices.Search.QueryTotal
-			totalQueryTime += node.Indices.Search.QueryTimeInMillis
-			totalIndexing += node.Indices.Indexing.IndexTotal
-			totalIndexTime += node.Indices.Indexing.IndexTimeInMillis
-			totalSegments += node.Indices.Segments.Count
-		}
-
-		queryRate := float64(totalQueries) / float64(totalQueryTime) * 1000  // queries per second
-		indexRate := float64(totalIndexing) / float64(totalIndexTime) * 1000 // docs per second
-
-		// GC metrics
-		var (
-			totalGCCollections int64
-			totalGCTime        int64
-		)
-
-		for _, node := range nodesStats.Nodes {
-			totalGCCollections += node.JVM.GC.Collectors.Young.CollectionCount + node.JVM.GC.Collectors.Old.CollectionCount
-			totalGCTime += node.JVM.GC.Collectors.Young.CollectionTimeInMillis + node.JVM.GC.Collectors.Old.CollectionTimeInMillis
-		}
-
-		// Update header
-		statusColor := map[string]string{
-			"green":  "green",
-			"yellow": "yellow",
-			"red":    "red",
-		}[clusterStats.Status]
-
-		// Get max lengths after fetching node and index info
-		maxNodeNameLen, maxIndexNameLen, maxTransportLen, maxIngestedLen := getMaxLengths(nodesInfo, indicesStats)
-
-		// Update header with dynamic padding
-		header.Clear()
-		latestVer := getLatestVersion()
-		padding := 0
-		if maxNodeNameLen > len(clusterStats.ClusterName) {
-			padding = maxNodeNameLen - len(clusterStats.ClusterName)
-		}
-		fmt.Fprintf(header, "[#00ffff]Cluster :[white] %s [#666666]([%s]%s[-]%s[#666666]) [#00ffff]Latest: [white]%s\n",
-			clusterStats.ClusterName,
-			statusColor,
-			strings.ToUpper(clusterStats.Status),
-			strings.Repeat(" ", padding),
-			latestVer)
-		fmt.Fprintf(header, "[#00ffff]Nodes   :[white] %d Total, [green]%d[white] Successful, [#ff5555]%d[white] Failed\n",
-			clusterStats.Nodes.Total,
-			clusterStats.Nodes.Successful,
-			clusterStats.Nodes.Failed)
-		fmt.Fprintf(header, "[#666666]Press 2-5 to toggle panels, 'h' to toggle hidden indices, 'q' to quit[white]\n")
-
-		// Update nodes panel with dynamic width
-		nodesPanel.Clear()
-		fmt.Fprintf(nodesPanel, "[::b][#00ffff][[#ff5555]2[#00ffff]] Nodes Information[::-]\n\n")
-		fmt.Fprint(nodesPanel, getNodesPanelHeader(maxNodeNameLen, maxTransportLen))
-
-		// Create a sorted slice of node IDs based on node names
-		var nodeIDs []string
-		for id := range nodesInfo.Nodes {
-			nodeIDs = append(nodeIDs, id)
-		}
-		sort.Slice(nodeIDs, func(i, j int) bool {
-			return nodesInfo.Nodes[nodeIDs[i]].Name < nodesInfo.Nodes[nodeIDs[j]].Name
-		})
-
-		// Update node entries with dynamic width
-		for _, id := range nodeIDs {
-			nodeInfo := nodesInfo.Nodes[id]
-			nodeStats, exists := nodesStats.Nodes[id]
-			if !exists {
-				continue
-			}
-
-			// Calculate resource percentages and format memory values
-			cpuPercent := nodeStats.OS.CPU.Percent
-			memPercent := float64(nodeStats.OS.Memory.UsedInBytes) / float64(nodeStats.OS.Memory.TotalInBytes) * 100
-			heapPercent := float64(nodeStats.JVM.Memory.HeapUsedInBytes) / float64(nodeStats.JVM.Memory.HeapMaxInBytes) * 100
-
-			// Calculate disk usage - use the data path stats
-			diskTotal := int64(0)
-			diskAvailable := int64(0)
-			if len(nodeStats.FS.Data) > 0 {
-				// Use the first data path's stats - this is the Elasticsearch data directory
-				diskTotal = nodeStats.FS.Data[0].TotalInBytes
-				diskAvailable = nodeStats.FS.Data[0].AvailableInBytes
-			} else {
-				// Fallback to total stats if data path stats aren't available
-				diskTotal = nodeStats.FS.Total.TotalInBytes
-				diskAvailable = nodeStats.FS.Total.AvailableInBytes
-			}
-			diskUsed := diskTotal - diskAvailable
-			diskPercent := float64(diskUsed) / float64(diskTotal) * 100
-
-			versionColor := "yellow"
-			if compareVersions(nodeInfo.Version, latestVer) {
-				versionColor = "green"
-			}
-
-			// Add this request before the nodes panel update
-			var catNodesStats []CatNodesStats
-			if err := makeRequest("/_cat/nodes?format=json&h=name,load_1m", &catNodesStats); err != nil {
-				nodesPanel.SetText(fmt.Sprintf("[red]Error getting cat nodes stats: %v", err))
-				return
-			}
-
-			// Create a map for quick lookup of load averages by node name
-			nodeLoads := make(map[string]string)
-			for _, node := range catNodesStats {
-				nodeLoads[node.Name] = node.Load1m
-			}
-
-			fmt.Fprintf(nodesPanel, "[#5555ff]%-*s [white] [#444444]│[white] %s [#444444]│[white] [white]%*s[white] [#444444]│[white] [%s]%-7s[white] [#444444]│[white] [%s]%3d%% [#444444](%d)[white] [#444444]│[white] %4s / %4s [%s]%3d%%[white] [#444444]│[white] %4s / %4s [%s]%3d%%[white] [#444444]│[white] %4s / %4s [%s]%3d%%[white] [#444444]│[white] %-8s[white] [#444444]│[white] %s [#bd93f9]%s[white] [#444444](%s)[white]\n",
-				maxNodeNameLen,
-				nodeInfo.Name,
-				formatNodeRoles(nodeInfo.Roles),
-				maxTransportLen,
-				nodeInfo.TransportAddress,
-				versionColor,
-				nodeInfo.Version,
-				getPercentageColor(float64(cpuPercent)),
-				cpuPercent,
-				nodeInfo.OS.AvailableProcessors,
-				formatResourceSize(nodeStats.OS.Memory.UsedInBytes),
-				formatResourceSize(nodeStats.OS.Memory.TotalInBytes),
-				getPercentageColor(memPercent),
-				int(memPercent),
-				formatResourceSize(nodeStats.JVM.Memory.HeapUsedInBytes),
-				formatResourceSize(nodeStats.JVM.Memory.HeapMaxInBytes),
-				getPercentageColor(heapPercent),
-				int(heapPercent),
-				formatResourceSize(diskUsed),
-				formatResourceSize(diskTotal),
-				getPercentageColor(diskPercent),
-				int(diskPercent),
-				formatUptime(nodeStats.JVM.UptimeInMillis),
-				nodeInfo.OS.PrettyName,
-				nodeInfo.OS.Version,
-				nodeInfo.OS.Arch)
 		}
 
 		// Get data streams info
 		var dataStreamResp DataStreamResponse
 		if err := makeRequest("/_data_stream", &dataStreamResp); err != nil {
-			indicesPanel.SetText(fmt.Sprintf("[red]Error getting data streams: %v", err))
+			showError(indicesPanel, fmt.Sprintf("[red]Error getting data streams: %v", err))
 			return
 		}
 
-		// Update indices panel with dynamic width
-		indicesPanel.Clear()
-		fmt.Fprintf(indicesPanel, "[::b][#00ffff][[#ff5555]4[#00ffff]] Indices Information[::-]\n\n")
-		fmt.Fprint(indicesPanel, getIndicesPanelHeader(maxIndexNameLen, maxIngestedLen))
+		// Read latest-ES-version state from the background poller — never blocks.
+		latestVer, versionFetched, versionErr := getLatestVersion()
 
-		// Update index entries with dynamic width
-		var indices []indexInfo
-		var totalDocs int
-		var totalSize int64
+		// All I/O is done — render UI
+		app.QueueUpdateDraw(func() {
 
-		// Collect index information
-		for _, index := range indicesStats {
-			// Skip hidden indices unless showHiddenIndices is true
-			if (!showHiddenIndices && strings.HasPrefix(index.Index, ".")) || index.DocsCount == "0" {
-				continue
+			// Query and indexing metrics
+			var (
+				totalQueries   int64
+				totalQueryTime int64
+				totalIndexing  int64
+				totalIndexTime int64
+				totalSegments  int64
+			)
+
+			for _, node := range nodesStats.Nodes {
+				totalQueries += node.Indices.Search.QueryTotal
+				totalQueryTime += node.Indices.Search.QueryTimeInMillis
+				totalIndexing += node.Indices.Indexing.IndexTotal
+				totalIndexTime += node.Indices.Indexing.IndexTimeInMillis
+				totalSegments += node.Indices.Segments.Count
 			}
-			docs := 0
-			fmt.Sscanf(index.DocsCount, "%d", &docs)
-			totalDocs += docs
 
-			// Track document changes
-			activity, exists := indexActivities[index.Index]
-			if !exists {
-				indexActivities[index.Index] = &IndexActivity{
-					LastDocsCount:    docs,
-					InitialDocsCount: docs,
-					StartTime:        time.Now(),
+			queryRate := float64(totalQueries) / float64(totalQueryTime) * 1000  // queries per second
+			indexRate := float64(totalIndexing) / float64(totalIndexTime) * 1000 // docs per second
+
+			// GC metrics
+			var (
+				totalGCCollections int64
+				totalGCTime        int64
+			)
+
+			for _, node := range nodesStats.Nodes {
+				totalGCCollections += node.JVM.GC.Collectors.Young.CollectionCount + node.JVM.GC.Collectors.Old.CollectionCount
+				totalGCTime += node.JVM.GC.Collectors.Young.CollectionTimeInMillis + node.JVM.GC.Collectors.Old.CollectionTimeInMillis
+			}
+
+			// Update header
+			statusColor := map[string]string{
+				"green":  "green",
+				"yellow": "yellow",
+				"red":    "red",
+			}[clusterStats.Status]
+
+			// Get max lengths after fetching node and index info
+			maxNodeNameLen, maxIndexNameLen, maxTransportLen, maxIngestedLen := getMaxLengths(nodesInfo, indicesStats)
+
+			// Update header with dynamic padding
+			header.Clear()
+			padding := 0
+			if maxNodeNameLen > len(clusterStats.ClusterName) {
+				padding = maxNodeNameLen - len(clusterStats.ClusterName)
+			}
+
+			// Render the "Latest:" segment based on the background poller's state.
+			var latestSegment string
+			switch {
+			case !versionFetched:
+				latestSegment = "[#666666]checking…[white]"
+			case versionErr != nil:
+				latestSegment = "[#ff5555]unavailable[white]"
+			default:
+				latestSegment = fmt.Sprintf("[white]%s", latestVer)
+			}
+
+			fmt.Fprintf(header, "[#00ffff]Cluster :[white] %s [#666666]([%s]%s[-]%s[#666666]) [#00ffff]Latest: %s\n",
+				clusterStats.ClusterName,
+				statusColor,
+				strings.ToUpper(clusterStats.Status),
+				strings.Repeat(" ", padding),
+				latestSegment)
+			fmt.Fprintf(header, "[#00ffff]Nodes   :[white] %d Total, [green]%d[white] Successful, [#ff5555]%d[white] Failed\n",
+				clusterStats.Nodes.Total,
+				clusterStats.Nodes.Successful,
+				clusterStats.Nodes.Failed)
+			fmt.Fprintf(header, "[#666666]Press 2-5 to toggle panels, 'h' to toggle hidden indices, 'q' to quit[white]\n")
+
+			// Update nodes panel with dynamic width
+			nodesPanel.Clear()
+			fmt.Fprintf(nodesPanel, "[::b][#00ffff][[#ff5555]2[#00ffff]] Nodes Information[::-]\n\n")
+			fmt.Fprint(nodesPanel, getNodesPanelHeader(maxNodeNameLen, maxTransportLen))
+
+			// Create a sorted slice of node IDs based on node names
+			var nodeIDs []string
+			for id := range nodesInfo.Nodes {
+				nodeIDs = append(nodeIDs, id)
+			}
+			sort.Slice(nodeIDs, func(i, j int) bool {
+				return nodesInfo.Nodes[nodeIDs[i]].Name < nodesInfo.Nodes[nodeIDs[j]].Name
+			})
+
+			// Update node entries with dynamic width
+			for _, id := range nodeIDs {
+				nodeInfo := nodesInfo.Nodes[id]
+				nodeStats, exists := nodesStats.Nodes[id]
+				if !exists {
+					continue
 				}
-			} else {
-				activity.LastDocsCount = docs
+
+				// Calculate resource percentages and format memory values
+				cpuPercent := nodeStats.OS.CPU.Percent
+				memPercent := float64(nodeStats.OS.Memory.UsedInBytes) / float64(nodeStats.OS.Memory.TotalInBytes) * 100
+				heapPercent := float64(nodeStats.JVM.Memory.HeapUsedInBytes) / float64(nodeStats.JVM.Memory.HeapMaxInBytes) * 100
+
+				// Calculate disk usage - use the data path stats
+				diskTotal := int64(0)
+				diskAvailable := int64(0)
+				if len(nodeStats.FS.Data) > 0 {
+					// Use the first data path's stats - this is the Elasticsearch data directory
+					diskTotal = nodeStats.FS.Data[0].TotalInBytes
+					diskAvailable = nodeStats.FS.Data[0].AvailableInBytes
+				} else {
+					// Fallback to total stats if data path stats aren't available
+					diskTotal = nodeStats.FS.Total.TotalInBytes
+					diskAvailable = nodeStats.FS.Total.AvailableInBytes
+				}
+				diskUsed := diskTotal - diskAvailable
+				diskPercent := float64(diskUsed) / float64(diskTotal) * 100
+
+				versionColor := "yellow"
+				if compareVersions(nodeInfo.Version, latestVer) {
+					versionColor = "green"
+				}
+
+				fmt.Fprintf(nodesPanel, "[#5555ff]%-*s [white] [#444444]│[white] %s [#444444]│[white] [white]%*s[white] [#444444]│[white] [%s]%-7s[white] [#444444]│[white] [%s]%3d%% [#444444](%d)[white] [#444444]│[white] %4s / %4s [%s]%3d%%[white] [#444444]│[white] %4s / %4s [%s]%3d%%[white] [#444444]│[white] %4s / %4s [%s]%3d%%[white] [#444444]│[white] %-8s[white] [#444444]│[white] %s [#bd93f9]%s[white] [#444444](%s)[white]\n",
+					maxNodeNameLen,
+					nodeInfo.Name,
+					formatNodeRoles(nodeInfo.Roles),
+					maxTransportLen,
+					nodeInfo.TransportAddress,
+					versionColor,
+					nodeInfo.Version,
+					getPercentageColor(float64(cpuPercent)),
+					cpuPercent,
+					nodeInfo.OS.AvailableProcessors,
+					formatResourceSize(nodeStats.OS.Memory.UsedInBytes),
+					formatResourceSize(nodeStats.OS.Memory.TotalInBytes),
+					getPercentageColor(memPercent),
+					int(memPercent),
+					formatResourceSize(nodeStats.JVM.Memory.HeapUsedInBytes),
+					formatResourceSize(nodeStats.JVM.Memory.HeapMaxInBytes),
+					getPercentageColor(heapPercent),
+					int(heapPercent),
+					formatResourceSize(diskUsed),
+					formatResourceSize(diskTotal),
+					getPercentageColor(diskPercent),
+					int(diskPercent),
+					formatUptime(nodeStats.JVM.UptimeInMillis),
+					nodeInfo.OS.PrettyName,
+					nodeInfo.OS.Version,
+					nodeInfo.OS.Arch)
 			}
 
-			// Get write operations count and calculate rate
-			writeOps := int64(0)
-			indexingRate := float64(0)
-			if stats, exists := indexWriteStats.Indices[index.Index]; exists {
-				writeOps = stats.Total.Indexing.IndexTotal
-				if activity, ok := indexActivities[index.Index]; ok {
-					timeDiff := time.Since(activity.StartTime).Seconds()
-					if timeDiff > 0 {
-						indexingRate = float64(docs-activity.InitialDocsCount) / timeDiff
+			// Update indices panel with dynamic width
+			indicesPanel.Clear()
+			fmt.Fprintf(indicesPanel, "[::b][#00ffff][[#ff5555]4[#00ffff]] Indices Information[::-]\n\n")
+			fmt.Fprint(indicesPanel, getIndicesPanelHeader(maxIndexNameLen, maxIngestedLen))
+
+			// Update index entries with dynamic width
+			var indices []indexInfo
+			var totalDocs int
+			var totalSize int64
+
+			// Collect index information
+			for _, index := range indicesStats {
+				// Skip hidden indices unless showHiddenIndices is true
+				if (!showHiddenIndices && strings.HasPrefix(index.Index, ".")) || index.DocsCount == "0" {
+					continue
+				}
+				docs := 0
+				fmt.Sscanf(index.DocsCount, "%d", &docs)
+				totalDocs += docs
+
+				// Track document changes
+				activity, exists := indexActivities[index.Index]
+				if !exists {
+					indexActivities[index.Index] = &IndexActivity{
+						LastDocsCount:    docs,
+						InitialDocsCount: docs,
+						StartTime:        time.Now(),
+					}
+				} else {
+					activity.LastDocsCount = docs
+				}
+
+				// Get write operations count and calculate rate
+				writeOps := int64(0)
+				indexingRate := float64(0)
+				if stats, exists := indexWriteStats.Indices[index.Index]; exists {
+					writeOps = stats.Total.Indexing.IndexTotal
+					if activity, ok := indexActivities[index.Index]; ok {
+						timeDiff := time.Since(activity.StartTime).Seconds()
+						if timeDiff > 0 {
+							indexingRate = float64(docs-activity.InitialDocsCount) / timeDiff
+						}
 					}
 				}
+
+				indices = append(indices, indexInfo{
+					index:        index.Index,
+					health:       index.Health,
+					docs:         docs,
+					storeSize:    index.StoreSize,
+					priShards:    index.PriShards,
+					replicas:     index.Replicas,
+					writeOps:     writeOps,
+					indexingRate: indexingRate,
+				})
 			}
 
-			indices = append(indices, indexInfo{
-				index:        index.Index,
-				health:       index.Health,
-				docs:         docs,
-				storeSize:    index.StoreSize,
-				priShards:    index.PriShards,
-				replicas:     index.Replicas,
-				writeOps:     writeOps,
-				indexingRate: indexingRate,
+			// Calculate total size
+			for _, node := range nodesStats.Nodes {
+				totalSize += node.FS.Total.TotalInBytes - node.FS.Total.AvailableInBytes
+			}
+
+			// Sort indices - active ones first, then alphabetically within each group
+			sort.Slice(indices, func(i, j int) bool {
+				// If one is active and the other isn't, active goes first
+				if (indices[i].indexingRate > 0) != (indices[j].indexingRate > 0) {
+					return indices[i].indexingRate > 0
+				}
+				// Within the same group (both active or both inactive), sort alphabetically
+				return indices[i].index < indices[j].index
 			})
-		}
 
-		// Calculate total size
-		for _, node := range nodesStats.Nodes {
-			totalSize += node.FS.Total.TotalInBytes - node.FS.Total.AvailableInBytes
-		}
+			// Update index entries with dynamic width
+			for _, idx := range indices {
+				writeIcon := "[#444444]⚪"
+				if idx.indexingRate > 0 {
+					writeIcon = "[#5555ff]⚫"
+				}
 
-		// Sort indices - active ones first, then alphabetically within each group
-		sort.Slice(indices, func(i, j int) bool {
-			// If one is active and the other isn't, active goes first
-			if (indices[i].indexingRate > 0) != (indices[j].indexingRate > 0) {
-				return indices[i].indexingRate > 0
-			}
-			// Within the same group (both active or both inactive), sort alphabetically
-			return indices[i].index < indices[j].index
-		})
+				// Add data stream indicator
+				streamIndicator := " "
+				if isDataStream(idx.index, dataStreamResp) {
+					streamIndicator = "[#bd93f9]⚫[white]"
+				}
 
-		// Update index entries with dynamic width
-		for _, idx := range indices {
-			writeIcon := "[#444444]⚪"
-			if idx.indexingRate > 0 {
-				writeIcon = "[#5555ff]⚫"
-			}
-
-			// Add data stream indicator
-			streamIndicator := " "
-			if isDataStream(idx.index, dataStreamResp) {
-				streamIndicator = "[#bd93f9]⚫[white]"
-			}
-
-			// Calculate document changes with dynamic padding
-			activity := indexActivities[idx.index]
-			ingestedStr := ""
-			if activity != nil && activity.InitialDocsCount < idx.docs {
-				docChange := idx.docs - activity.InitialDocsCount
-				ingestedStr = fmt.Sprintf("[green]%-*s", maxIngestedLen, fmt.Sprintf("+%s", formatNumber(docChange)))
-			} else {
-				ingestedStr = fmt.Sprintf("%-*s", maxIngestedLen, "")
-			}
-
-			// Format indexing rate
-			rateStr := ""
-			if idx.indexingRate > 0 {
-				if idx.indexingRate >= 1000 {
-					rateStr = fmt.Sprintf("[#50fa7b]%.1fk/s", idx.indexingRate/1000)
+				// Calculate document changes with dynamic padding
+				activity := indexActivities[idx.index]
+				ingestedStr := ""
+				if activity != nil && activity.InitialDocsCount < idx.docs {
+					docChange := idx.docs - activity.InitialDocsCount
+					ingestedStr = fmt.Sprintf("[green]%-*s", maxIngestedLen, fmt.Sprintf("+%s", formatNumber(docChange)))
 				} else {
-					rateStr = fmt.Sprintf("[#50fa7b]%.1f/s", idx.indexingRate)
+					ingestedStr = fmt.Sprintf("%-*s", maxIngestedLen, "")
+				}
+
+				// Format indexing rate
+				rateStr := ""
+				if idx.indexingRate > 0 {
+					if idx.indexingRate >= 1000 {
+						rateStr = fmt.Sprintf("[#50fa7b]%.1fk/s", idx.indexingRate/1000)
+					} else {
+						rateStr = fmt.Sprintf("[#50fa7b]%.1f/s", idx.indexingRate)
+					}
+				} else {
+					rateStr = "[#444444]0/s"
+				}
+
+				// Convert the size format before display
+				sizeStr := convertSizeFormat(idx.storeSize)
+
+				fmt.Fprintf(indicesPanel, "%s %s[%s]%-*s[white] [#444444]│[white] %13s [#444444]│[white] %5s [#444444]│[white] %6s [#444444]│[white] %8s [#444444]│[white] %-*s [#444444]│[white] %-8s\n",
+					writeIcon,
+					streamIndicator,
+					getHealthColor(idx.health),
+					maxIndexNameLen,
+					idx.index,
+					formatNumber(idx.docs),
+					sizeStr,
+					idx.priShards,
+					idx.replicas,
+					maxIngestedLen,
+					ingestedStr,
+					rateStr)
+			}
+
+			// Calculate total indexing rate for the cluster
+			totalIndexingRate := float64(0)
+			for _, idx := range indices {
+				totalIndexingRate += idx.indexingRate
+			}
+
+			// Format cluster indexing rate
+			clusterRateStr := ""
+			if totalIndexingRate > 0 {
+				if totalIndexingRate >= 1000000 {
+					clusterRateStr = fmt.Sprintf("[#50fa7b]%.1fM/s", totalIndexingRate/1000000)
+				} else if totalIndexingRate >= 1000 {
+					clusterRateStr = fmt.Sprintf("[#50fa7b]%.1fK/s", totalIndexingRate/1000)
+				} else {
+					clusterRateStr = fmt.Sprintf("[#50fa7b]%.1f/s", totalIndexingRate)
 				}
 			} else {
-				rateStr = "[#444444]0/s"
+				clusterRateStr = "[#444444]0/s"
 			}
 
-			// Convert the size format before display
-			sizeStr := convertSizeFormat(idx.storeSize)
+			// Display the totals with indexing rate
+			fmt.Fprintf(indicesPanel, "\n[#00ffff]Total Documents:[white] %s, [#00ffff]Total Size:[white] %s, [#00ffff]Indexing Rate:[white] %s\n",
+				formatNumber(totalDocs),
+				bytesToHuman(totalSize),
+				clusterRateStr)
 
-			fmt.Fprintf(indicesPanel, "%s %s[%s]%-*s[white] [#444444]│[white] %13s [#444444]│[white] %5s [#444444]│[white] %6s [#444444]│[white] %8s [#444444]│[white] %-*s [#444444]│[white] %-8s\n",
-				writeIcon,
-				streamIndicator,
-				getHealthColor(idx.health),
-				maxIndexNameLen,
-				idx.index,
-				formatNumber(idx.docs),
-				sizeStr,
-				idx.priShards,
-				idx.replicas,
-				maxIngestedLen,
-				ingestedStr,
-				rateStr)
-		}
+			// Move shard stats to bottom of indices panel
+			fmt.Fprintf(indicesPanel, "\n[#00ffff]Shard Status:[white] Active: %d (%.1f%%), Primary: %d, Relocating: %d, Initializing: %d, Unassigned: %d\n",
+				clusterHealth.ActiveShards,
+				clusterHealth.ActiveShardsPercentAsNumber,
+				clusterHealth.ActivePrimaryShards,
+				clusterHealth.RelocatingShards,
+				clusterHealth.InitializingShards,
+				clusterHealth.UnassignedShards)
 
-		// Calculate total indexing rate for the cluster
-		totalIndexingRate := float64(0)
-		for _, idx := range indices {
-			totalIndexingRate += idx.indexingRate
-		}
+			// Update metrics panel
+			metricsPanel.Clear()
+			fmt.Fprintf(metricsPanel, "[::b][#00ffff][[#ff5555]5[#00ffff]] Cluster Metrics[::-]\n\n")
 
-		// Format cluster indexing rate
-		clusterRateStr := ""
-		if totalIndexingRate > 0 {
-			if totalIndexingRate >= 1000000 {
-				clusterRateStr = fmt.Sprintf("[#50fa7b]%.1fM/s", totalIndexingRate/1000000)
-			} else if totalIndexingRate >= 1000 {
-				clusterRateStr = fmt.Sprintf("[#50fa7b]%.1fK/s", totalIndexingRate/1000)
-			} else {
-				clusterRateStr = fmt.Sprintf("[#50fa7b]%.1f/s", totalIndexingRate)
+			// Define metrics keys with proper grouping
+			metricKeys := []string{
+				// System metrics
+				"CPU",
+				"Memory",
+				"Heap",
+				"Disk",
+
+				// Network metrics
+				"Network TX",
+				"Network RX",
+				"HTTP Connections",
+
+				// Performance metrics
+				"Query Rate",
+				"Index Rate",
+
+				// Miscellaneous
+				"Snapshots",
 			}
-		} else {
-			clusterRateStr = "[#444444]0/s"
-		}
 
-		// Display the totals with indexing rate
-		fmt.Fprintf(indicesPanel, "\n[#00ffff]Total Documents:[white] %s, [#00ffff]Total Size:[white] %s, [#00ffff]Indexing Rate:[white] %s\n",
-			formatNumber(totalDocs),
-			bytesToHuman(totalSize),
-			clusterRateStr)
+			// Find the longest key for proper alignment
+			maxKeyLength := 0
+			for _, key := range metricKeys {
+				if len(key) > maxKeyLength {
+					maxKeyLength = len(key)
+				}
+			}
 
-		// Move shard stats to bottom of indices panel
-		fmt.Fprintf(indicesPanel, "\n[#00ffff]Shard Status:[white] Active: %d (%.1f%%), Primary: %d, Relocating: %d, Initializing: %d, Unassigned: %d\n",
-			clusterHealth.ActiveShards,
-			clusterHealth.ActiveShardsPercentAsNumber,
-			clusterHealth.ActivePrimaryShards,
-			clusterHealth.RelocatingShards,
-			clusterHealth.InitializingShards,
-			clusterHealth.UnassignedShards)
+			// Add padding for better visual separation
+			maxKeyLength += 2
 
-		// Update metrics panel
-		metricsPanel.Clear()
-		fmt.Fprintf(metricsPanel, "[::b][#00ffff][[#ff5555]5[#00ffff]] Cluster Metrics[::-]\n\n")
+			// Helper function for metric lines with proper alignment
+			formatMetric := func(name string, value string) string {
+				return fmt.Sprintf("[#00ffff]%-*s[white] %s\n", maxKeyLength, name+":", value)
+			}
 
-		// Define metrics keys with proper grouping
-		metricKeys := []string{
-			// System metrics
-			"CPU",
-			"Memory",
-			"Heap",
-			"Disk",
+			// CPU metrics
+			totalProcessors := 0
+			for _, node := range nodesInfo.Nodes {
+				totalProcessors += node.OS.AvailableProcessors
+			}
+			cpuPercent := float64(clusterStats.Process.CPU.Percent)
+			fmt.Fprint(metricsPanel, formatMetric("CPU", fmt.Sprintf("%7.1f%% [#444444](%d processors)[white]", cpuPercent, totalProcessors)))
+
+			// Disk metrics
+			diskUsed := getTotalSize(nodesStats)
+			diskTotal := getTotalDiskSpace(nodesStats)
+			diskPercent := float64(diskUsed) / float64(diskTotal) * 100
+			fmt.Fprint(metricsPanel, formatMetric("Disk", fmt.Sprintf("%8s / %8s [%s]%5.1f%%[white]",
+				bytesToHuman(diskUsed),
+				bytesToHuman(diskTotal),
+				getPercentageColor(diskPercent),
+				diskPercent)))
+
+			// Calculate heap and memory totals
+			var (
+				totalHeapUsed    int64
+				totalHeapMax     int64
+				totalMemoryUsed  int64
+				totalMemoryTotal int64
+			)
+
+			for _, node := range nodesStats.Nodes {
+				totalHeapUsed += node.JVM.Memory.HeapUsedInBytes
+				totalHeapMax += node.JVM.Memory.HeapMaxInBytes
+				totalMemoryUsed += node.OS.Memory.UsedInBytes
+				totalMemoryTotal += node.OS.Memory.TotalInBytes
+			}
+
+			// Heap metrics
+			heapPercent := float64(totalHeapUsed) / float64(totalHeapMax) * 100
+			fmt.Fprint(metricsPanel, formatMetric("Heap", fmt.Sprintf("%8s / %8s [%s]%5.1f%%[white]",
+				bytesToHuman(totalHeapUsed),
+				bytesToHuman(totalHeapMax),
+				getPercentageColor(heapPercent),
+				heapPercent)))
+
+			// Memory metrics
+			memoryPercent := float64(totalMemoryUsed) / float64(totalMemoryTotal) * 100
+			fmt.Fprint(metricsPanel, formatMetric("Memory", fmt.Sprintf("%8s / %8s [%s]%5.1f%%[white]",
+				bytesToHuman(totalMemoryUsed),
+				bytesToHuman(totalMemoryTotal),
+				getPercentageColor(memoryPercent),
+				memoryPercent)))
 
 			// Network metrics
-			"Network TX",
-			"Network RX",
-			"HTTP Connections",
+			fmt.Fprint(metricsPanel, formatMetric("Network TX", fmt.Sprintf(" %7s", bytesToHuman(getTotalNetworkTX(nodesStats)))))
+			fmt.Fprint(metricsPanel, formatMetric("Network RX", fmt.Sprintf(" %7s", bytesToHuman(getTotalNetworkRX(nodesStats)))))
 
-			// Performance metrics
-			"Query Rate",
-			"Index Rate",
+			// HTTP Connections and Shard metrics - right aligned to match Network RX 'G'
+			fmt.Fprint(metricsPanel, formatMetric("HTTP Connections", fmt.Sprintf("%8s", formatNumber(int(getTotalHTTPConnections(nodesStats))))))
+			fmt.Fprint(metricsPanel, formatMetric("Query Rate", fmt.Sprintf("%6s/s", formatNumber(int(queryRate)))))
+			fmt.Fprint(metricsPanel, formatMetric("Index Rate", fmt.Sprintf("%6s/s", formatNumber(int(indexRate)))))
 
-			// Miscellaneous
-			"Snapshots",
-		}
+			// Snapshots
+			fmt.Fprint(metricsPanel, formatMetric("Snapshots", fmt.Sprintf("%8s", formatNumber(clusterStats.Snapshots.Count))))
 
-		// Find the longest key for proper alignment
-		maxKeyLength := 0
-		for _, key := range metricKeys {
-			if len(key) > maxKeyLength {
-				maxKeyLength = len(key)
+			if showRoles {
+				updateRolesPanel(rolesPanel, nodesInfo)
 			}
-		}
-
-		// Add padding for better visual separation
-		maxKeyLength += 2
-
-		// Helper function for metric lines with proper alignment
-		formatMetric := func(name string, value string) string {
-			return fmt.Sprintf("[#00ffff]%-*s[white] %s\n", maxKeyLength, name+":", value)
-		}
-
-		// CPU metrics
-		totalProcessors := 0
-		for _, node := range nodesInfo.Nodes {
-			totalProcessors += node.OS.AvailableProcessors
-		}
-		cpuPercent := float64(clusterStats.Process.CPU.Percent)
-		fmt.Fprint(metricsPanel, formatMetric("CPU", fmt.Sprintf("%7.1f%% [#444444](%d processors)[white]", cpuPercent, totalProcessors)))
-
-		// Disk metrics
-		diskUsed := getTotalSize(nodesStats)
-		diskTotal := getTotalDiskSpace(nodesStats)
-		diskPercent := float64(diskUsed) / float64(diskTotal) * 100
-		fmt.Fprint(metricsPanel, formatMetric("Disk", fmt.Sprintf("%8s / %8s [%s]%5.1f%%[white]",
-			bytesToHuman(diskUsed),
-			bytesToHuman(diskTotal),
-			getPercentageColor(diskPercent),
-			diskPercent)))
-
-		// Calculate heap and memory totals
-		var (
-			totalHeapUsed    int64
-			totalHeapMax     int64
-			totalMemoryUsed  int64
-			totalMemoryTotal int64
-		)
-
-		for _, node := range nodesStats.Nodes {
-			totalHeapUsed += node.JVM.Memory.HeapUsedInBytes
-			totalHeapMax += node.JVM.Memory.HeapMaxInBytes
-			totalMemoryUsed += node.OS.Memory.UsedInBytes
-			totalMemoryTotal += node.OS.Memory.TotalInBytes
-		}
-
-		// Heap metrics
-		heapPercent := float64(totalHeapUsed) / float64(totalHeapMax) * 100
-		fmt.Fprint(metricsPanel, formatMetric("Heap", fmt.Sprintf("%8s / %8s [%s]%5.1f%%[white]",
-			bytesToHuman(totalHeapUsed),
-			bytesToHuman(totalHeapMax),
-			getPercentageColor(heapPercent),
-			heapPercent)))
-
-		// Memory metrics
-		memoryPercent := float64(totalMemoryUsed) / float64(totalMemoryTotal) * 100
-		fmt.Fprint(metricsPanel, formatMetric("Memory", fmt.Sprintf("%8s / %8s [%s]%5.1f%%[white]",
-			bytesToHuman(totalMemoryUsed),
-			bytesToHuman(totalMemoryTotal),
-			getPercentageColor(memoryPercent),
-			memoryPercent)))
-
-		// Network metrics
-		fmt.Fprint(metricsPanel, formatMetric("Network TX", fmt.Sprintf(" %7s", bytesToHuman(getTotalNetworkTX(nodesStats)))))
-		fmt.Fprint(metricsPanel, formatMetric("Network RX", fmt.Sprintf(" %7s", bytesToHuman(getTotalNetworkRX(nodesStats)))))
-
-		// HTTP Connections and Shard metrics - right aligned to match Network RX 'G'
-		fmt.Fprint(metricsPanel, formatMetric("HTTP Connections", fmt.Sprintf("%8s", formatNumber(int(getTotalHTTPConnections(nodesStats))))))
-		fmt.Fprint(metricsPanel, formatMetric("Query Rate", fmt.Sprintf("%6s/s", formatNumber(int(queryRate)))))
-		fmt.Fprint(metricsPanel, formatMetric("Index Rate", fmt.Sprintf("%6s/s", formatNumber(int(indexRate)))))
-
-		// Snapshots
-		fmt.Fprint(metricsPanel, formatMetric("Snapshots", fmt.Sprintf("%8s", formatNumber(clusterStats.Snapshots.Count))))
-
-		if showRoles {
-			updateRolesPanel(rolesPanel, nodesInfo)
-		}
+		}) // end QueueUpdateDraw render closure
 	}
 
-	// Set up periodic updates
+	// Start the background latest-version poller. Runs independently of the
+	// data refresh loop; the UI reads its cached result every render.
+	startVersionPoller()
+
+	// Set up periodic updates. update() fetches data off the UI thread and
+	// only takes the draw lock to render — so the UI stays responsive.
 	go func() {
 		for {
-			app.QueueUpdateDraw(func() {
-				update()
-			})
+			update()
 			time.Sleep(5 * time.Second)
 		}
 	}()
